@@ -1,0 +1,127 @@
+name: YouTube Download and Save to Repo
+
+on:
+  push:
+    branches:
+      - "**"
+
+jobs:
+  yt-download:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install yt-dlp and ffmpeg
+        run: |
+          sudo apt-get install -y ffmpeg
+          sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
+          sudo chmod a+rx /usr/local/bin/yt-dlp
+
+      - name: Extract URL from commit message
+        id: parse
+        run: |
+          set -euo pipefail
+
+          MSG=$(git log -1 --pretty=%B)
+          echo "Commit message: $MSG"
+
+          if echo "$MSG" | grep -qP '^yt:'; then
+            URL=$(echo "$MSG" | grep -oP 'yt:\s*\K.*' | tr -d '[:space:]')
+          else
+            echo "⏭️ Not a yt: trigger — skipping"
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "URL: $URL"
+          echo "url=$URL" >> $GITHUB_OUTPUT
+          echo "skip=false" >> $GITHUB_OUTPUT
+
+      - name: Download video via yt-dlp
+        if: steps.parse.outputs.skip == 'false'
+        id: download
+        run: |
+          set -euo pipefail
+
+          URL="${{ steps.parse.outputs.url }}"
+          mkdir -p tmp_downloads
+
+          echo "⬇️ Downloading: $URL"
+          yt-dlp \
+            --format "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]" \
+            --merge-output-format mp4 \
+            --output "tmp_downloads/%(title)s.%(ext)s" \
+            --no-playlist \
+            --retries 5 \
+            --fragment-retries 5 \
+            --no-part \
+            "$URL"
+
+          FILENAME=$(ls tmp_downloads/)
+          FILEPATH="tmp_downloads/$FILENAME"
+          SIZE=$(stat -c%s "$FILEPATH")
+          echo "✅ Downloaded: $FILENAME ($(( SIZE / 1024 / 1024 ))MB)"
+
+          echo "filename=$FILENAME" >> $GITHUB_OUTPUT
+          echo "filepath=$FILEPATH" >> $GITHUB_OUTPUT
+          echo "size=$SIZE" >> $GITHUB_OUTPUT
+
+      - name: Copy to downloads folder
+        if: steps.parse.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+
+          mkdir -p downloads
+          FILEPATH="${{ steps.download.outputs.filepath }}"
+          FILENAME="${{ steps.download.outputs.filename }}"
+          SIZE="${{ steps.download.outputs.size }}"
+          LIMIT=$((90 * 1024 * 1024))
+
+          if [ "$SIZE" -gt "$LIMIT" ]; then
+            echo "✂️ File is $(( SIZE / 1024 / 1024 ))MB — splitting into 90MB parts..."
+
+            mkdir -p tmp_splits
+
+            SPLIT_BASENAME="${FILENAME%.*}.bin"
+            RENAMED="tmp_downloads/$SPLIT_BASENAME"
+            mv "$FILEPATH" "$RENAMED"
+
+            zip -s 90m "tmp_splits/${SPLIT_BASENAME}.zip" -j "$RENAMED"
+
+            PART_COUNT=$(ls tmp_splits/ | wc -l)
+            echo "✅ Split into $PART_COUNT parts"
+
+            mv tmp_splits/* downloads/
+            rm -rf tmp_splits
+          else
+            cp "$FILEPATH" "downloads/$FILENAME"
+            echo "✅ Copied: $FILENAME"
+          fi
+
+          rm -rf tmp_downloads
+
+      - name: Commit & Push
+        if: steps.parse.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+
+          BRANCH="${GITHUB_REF_NAME}"
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add downloads/
+
+          if git diff --cached --quiet; then
+            echo "⚠️ Nothing to commit"
+            exit 0
+          fi
+
+          FILENAME="${{ steps.download.outputs.filename }}"
+          git commit -m "Add YouTube video: $FILENAME [skip ci]"
+          echo "🚀 Pushing to branch: $BRANCH"
+          git push origin "HEAD:$BRANCH"
