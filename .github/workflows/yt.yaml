@@ -1,4 +1,4 @@
-name: YouTube Download and Save to Repo
+name: YouTube Download
 
 on:
   push:
@@ -19,11 +19,11 @@ jobs:
 
       - name: Install yt-dlp and ffmpeg
         run: |
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg zip
           sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
           sudo chmod a+rx /usr/local/bin/yt-dlp
 
-      - name: Extract URL from commit message
+      - name: Extract URL and mode from commit message
         id: parse
         run: |
           set -euo pipefail
@@ -31,16 +31,22 @@ jobs:
           MSG=$(git log -1 --pretty=%B)
           echo "Commit message: $MSG"
 
-          if echo "$MSG" | grep -qP '^yt:'; then
+          if echo "$MSG" | grep -qP '^yt2:'; then
+            URL=$(echo "$MSG" | grep -oP 'yt2:\s*\K.*' | tr -d '[:space:]')
+            MODE="release"
+          elif echo "$MSG" | grep -qP '^yt:'; then
             URL=$(echo "$MSG" | grep -oP 'yt:\s*\K.*' | tr -d '[:space:]')
+            MODE="commit"
           else
-            echo "⏭️ Not a yt: trigger — skipping"
+            echo "⏭️ Not a yt trigger — skipping"
             echo "skip=true" >> $GITHUB_OUTPUT
             exit 0
           fi
 
           echo "URL: $URL"
+          echo "Mode: $MODE"
           echo "url=$URL" >> $GITHUB_OUTPUT
+          echo "mode=$MODE" >> $GITHUB_OUTPUT
           echo "skip=false" >> $GITHUB_OUTPUT
 
       - name: Download video via yt-dlp
@@ -72,12 +78,14 @@ jobs:
           echo "filepath=$FILEPATH" >> $GITHUB_OUTPUT
           echo "size=$SIZE" >> $GITHUB_OUTPUT
 
-      - name: Copy to downloads folder
-        if: steps.parse.outputs.skip == 'false'
+      # ─── COMMIT MODE (yt:) ───────────────────────────────────────────
+
+      - name: Split and commit to repo
+        if: steps.parse.outputs.skip == 'false' && steps.parse.outputs.mode == 'commit'
         run: |
           set -euo pipefail
 
-          mkdir -p downloads
+          mkdir -p downloads tmp_splits
           FILEPATH="${{ steps.download.outputs.filepath }}"
           FILENAME="${{ steps.download.outputs.filename }}"
           SIZE="${{ steps.download.outputs.size }}"
@@ -85,8 +93,6 @@ jobs:
 
           if [ "$SIZE" -gt "$LIMIT" ]; then
             echo "✂️ File is $(( SIZE / 1024 / 1024 ))MB — splitting into 90MB parts..."
-
-            mkdir -p tmp_splits
 
             SPLIT_BASENAME="${FILENAME%.*}.bin"
             RENAMED="tmp_downloads/$SPLIT_BASENAME"
@@ -96,7 +102,6 @@ jobs:
 
             PART_COUNT=$(ls tmp_splits/ | wc -l)
             echo "✅ Split into $PART_COUNT parts"
-
             mv tmp_splits/* downloads/
             rm -rf tmp_splits
           else
@@ -107,7 +112,7 @@ jobs:
           rm -rf tmp_downloads
 
       - name: Commit & Push
-        if: steps.parse.outputs.skip == 'false'
+        if: steps.parse.outputs.skip == 'false' && steps.parse.outputs.mode == 'commit'
         run: |
           set -euo pipefail
 
@@ -125,3 +130,80 @@ jobs:
           git commit -m "Add YouTube video: $FILENAME [skip ci]"
           echo "🚀 Pushing to branch: $BRANCH"
           git push origin "HEAD:$BRANCH"
+
+      # ─── RELEASE MODE (yt2:) ─────────────────────────────────────────
+
+      - name: Split for release
+        if: steps.parse.outputs.skip == 'false' && steps.parse.outputs.mode == 'release'
+        run: |
+          set -euo pipefail
+
+          FILEPATH="${{ steps.download.outputs.filepath }}"
+          FILENAME="${{ steps.download.outputs.filename }}"
+          SIZE="${{ steps.download.outputs.size }}"
+          LIMIT=$((2000 * 1024 * 1024))
+
+          mkdir -p tmp_splits release_files
+
+          if [ "$SIZE" -gt "$LIMIT" ]; then
+            echo "✂️ File is $(( SIZE / 1024 / 1024 ))MB — splitting into 2GB parts..."
+
+            SPLIT_BASENAME="${FILENAME%.*}.bin"
+            RENAMED="tmp_downloads/$SPLIT_BASENAME"
+            mv "$FILEPATH" "$RENAMED"
+
+            zip -s 2000m "tmp_splits/${SPLIT_BASENAME}.zip" -j "$RENAMED"
+
+            PART_COUNT=$(ls tmp_splits/ | wc -l)
+            echo "✅ Split into $PART_COUNT parts"
+            mv tmp_splits/* release_files/
+          else
+            cp "$FILEPATH" "release_files/$FILENAME"
+            echo "✅ Copied: $FILENAME — no split needed"
+          fi
+
+          rm -rf tmp_downloads tmp_splits
+
+      - name: Create GitHub Release
+        if: steps.parse.outputs.skip == 'false' && steps.parse.outputs.mode == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          FILENAME="${{ steps.download.outputs.filename }}"
+          TAG="yt-release-$(date +%Y%m%d-%H%M%S)"
+          TITLE="YouTube: $FILENAME"
+          PART_COUNT=$(ls release_files/ | wc -l)
+          SPLIT_BASENAME="${FILENAME%.*}.bin"
+          DOWNLOAD_URL="${{ steps.parse.outputs.url }}"
+
+          if [ "$PART_COUNT" -gt 1 ]; then
+            cat > release_notes.md << EOF_NOTES
+          YouTube URL: ${DOWNLOAD_URL}
+
+          Split into ${PART_COUNT} parts of 2GB each.
+
+          To reassemble on Windows:
+          1. Download all parts (.zip + .z01 .z02 ...)
+          2. Right-click the .zip part and extract with 7-Zip or WinRAR
+          3. It will automatically reassemble all parts
+
+          To reassemble on Linux/Mac:
+          zip -F ${SPLIT_BASENAME}.zip --fix --out full.mp4
+          EOF_NOTES
+          else
+            cat > release_notes.md << EOF_NOTES
+          YouTube URL: ${DOWNLOAD_URL}
+          EOF_NOTES
+          fi
+
+          echo "🏷️ Creating release: $TAG"
+          gh release create "$TAG" \
+            --title "$TITLE" \
+            --notes-file release_notes.md \
+            release_files/*
+
+          echo "✅ Release created: $TAG"
+          echo "📎 Uploaded $PART_COUNT file(s)"
+          rm -rf release_files release_notes.md
